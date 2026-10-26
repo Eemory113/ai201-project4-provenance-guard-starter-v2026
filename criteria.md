@@ -42,37 +42,47 @@ Two things worth knowing before you pick numbers:
   a **miss**.
 
 ---
-## 1.
+## 1. False positives
 
-<!-- Your criterion. It must name a number. -->
-
-
-
-**Why this target:**
+Of 10 pieces I wrote myself, no more than 1 is labelled high-confidence AI in
+each of the three trials.
 
 
 
----
-
-## 2.
-
-<!-- Your criterion. -->
-
-
-
-**Why this target:**
+**Why this target:** A false accusation can harm a real writer, so I want the
+false-positive rate to stay at or below 10%. Requiring the target to hold in
+all three trials also accounts for scores that can vary between runs.
 
 
 
 ---
 
-## 3.
+## 2. Score spread
 
-<!-- Your criterion. -->
+In each of the three trials, the average combined score for clearly-AI text is
+at least 0.20 higher than the average combined score for clearly-human text.
 
 
 
-**Why this target:**
+**Why this target:** Scores range from 0 to 1, so a 0.20-point gap is a
+meaningful, measurable separation without expecting perfect detection. Comparing
+averages across several examples avoids judging the detector from one unusual
+text.
+
+
+
+---
+
+## 3. Label coverage
+
+In each of the three trials, the test set produces at least one high-confidence
+human label, one unsure label, and one high-confidence AI label.
+
+
+
+**Why this target:** All three labels need to be reachable for the service to
+communicate human, uncertain, and AI-like results. Requiring one example of
+each in every trial checks that coverage is repeatable, not a one-time result.
 
 
 
