@@ -20,8 +20,10 @@ and the one you most want to compare is the one from before the change.
 """
 
 import json
+import os
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 import config
 
@@ -41,6 +43,8 @@ def log_decision(
     combined_score: float | None = None,
     label: str | None = None,
     status: str = "decided",
+    request_id: str | None = None,
+    submitted_text: str | None = None,
     **extra,
 ) -> dict:
     """
@@ -60,6 +64,7 @@ def log_decision(
     """
     entry = {
         "timestamp": _now(),
+        "event": "decision",
         "content_id": content_id,
         "creator_id": creator_id,
         "guess": guess,
@@ -69,11 +74,24 @@ def log_decision(
         "label": label,
         "status": status,
     }
+    if request_id is not None:
+        entry["request_id"] = request_id
+    if submitted_text is not None:
+        entry["submitted_text"] = submitted_text[:config.AUDIT_MAX_CONTENT_CHARS]
+        entry["submitted_text_truncated"] = (
+            len(submitted_text) > config.AUDIT_MAX_CONTENT_CHARS
+        )
     entry.update(extra)
     return _append(entry)
 
 
-def log_appeal(content_id: str, creator_id: str, reasoning: str) -> dict:
+def log_appeal(
+    content_id: str,
+    creator_id: str,
+    reasoning: str,
+    *,
+    request_id: str | None = None,
+) -> dict:
     """
     Record an appeal beside the original decision.
 
@@ -82,14 +100,20 @@ def log_appeal(content_id: str, creator_id: str, reasoning: str) -> dict:
     the whole point of an audit log. Someone reading it later can see what was
     decided, that it was challenged, and in what order.
     """
-    return _append({
+    bounded_reasoning = reasoning[:config.AUDIT_MAX_CONTENT_CHARS]
+    entry = {
         "timestamp": _now(),
+        "request_id": request_id,
         "content_id": content_id,
         "creator_id": creator_id,
         "event": "appeal",
         "status": "under_review",
-        "reasoning": reasoning,
-    })
+        "reasoning": bounded_reasoning,
+        "reasoning_truncated": len(reasoning) > config.AUDIT_MAX_CONTENT_CHARS,
+    }
+    if request_id is None:
+        del entry["request_id"]
+    return _append(entry)
 
 
 def log_rejection(creator_id: str, reason: str, **extra) -> dict:
@@ -112,13 +136,76 @@ def log_rejection(creator_id: str, reason: str, **extra) -> dict:
     })
 
 
+def log_http_request(
+    request_id: str,
+    method: str,
+    path: str,
+    endpoint: str | None,
+    status_code: int,
+    duration_ms: float,
+) -> dict:
+    """Record the outcome and timing for one completed HTTP request."""
+    if status_code < 400:
+        outcome = "success"
+    elif status_code < 500:
+        outcome = "rejected"
+    else:
+        outcome = "error"
+
+    return _append({
+        "timestamp": _now(),
+        "event": "request",
+        "request_id": request_id,
+        "method": method,
+        "path": path,
+        "endpoint": endpoint,
+        "status_code": status_code,
+        "outcome": outcome,
+        "duration_ms": round(max(duration_ms, 0.0), 3),
+    })
+
+
 def _append(entry: dict) -> dict:
-    config.LOG_DIR.mkdir(parents=True, exist_ok=True)
     line = json.dumps(entry, ensure_ascii=False)
+    encoded_line = (line + "\n").encode("utf-8")
     with _lock:
+        config.LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        config.LOG_DIR.chmod(0o700)
+        _rotate_if_needed(len(encoded_line))
         with config.AUDIT_LOG.open("a", encoding="utf-8") as f:
+            os.chmod(config.AUDIT_LOG, 0o600)
             f.write(line + "\n")
     return entry
+
+
+def _rotate_if_needed(next_line_bytes: int) -> None:
+    if (
+        not config.AUDIT_LOG.exists()
+        or config.AUDIT_LOG.stat().st_size + next_line_bytes <= config.AUDIT_MAX_BYTES
+    ):
+        return
+
+    oldest_backup = config.AUDIT_LOG.with_name(
+        f"{config.AUDIT_LOG.name}.{config.AUDIT_BACKUP_COUNT}"
+    )
+    oldest_backup.unlink(missing_ok=True)
+
+    for index in range(config.AUDIT_BACKUP_COUNT - 1, 0, -1):
+        source = config.AUDIT_LOG.with_name(f"{config.AUDIT_LOG.name}.{index}")
+        if source.exists():
+            source.replace(config.AUDIT_LOG.with_name(f"{config.AUDIT_LOG.name}.{index + 1}"))
+
+    config.AUDIT_LOG.replace(config.AUDIT_LOG.with_name(f"{config.AUDIT_LOG.name}.1"))
+
+
+def _log_files() -> list[Path]:
+    backups = [
+        config.AUDIT_LOG.with_name(f"{config.AUDIT_LOG.name}.{index}")
+        for index in range(config.AUDIT_BACKUP_COUNT, 0, -1)
+    ]
+    return [path for path in backups if path.exists()] + (
+        [config.AUDIT_LOG] if config.AUDIT_LOG.exists() else []
+    )
 
 
 def read_entries(limit: int | None = None) -> list[dict]:
@@ -128,18 +215,23 @@ def read_entries(limit: int | None = None) -> list[dict]:
     A malformed line is skipped rather than raising — a log that can't be read
     because of one bad row is worse than a log with a gap.
     """
-    if not config.AUDIT_LOG.exists():
+    if limit is not None and limit <= 0:
+        return []
+
+    log_paths = _log_files()
+    if not log_paths:
         return []
 
     entries = []
-    for line in config.AUDIT_LOG.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entries.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
+    for log_path in log_paths:
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
 
     return entries[-limit:] if limit else entries
 
@@ -147,8 +239,9 @@ def read_entries(limit: int | None = None) -> list[dict]:
 def clear() -> int:
     """Wipe the log. Handy between attack runs; returns how many went."""
     count = len(read_entries())
-    if config.AUDIT_LOG.exists():
-        config.AUDIT_LOG.unlink()
+    with _lock:
+        for log_path in _log_files():
+            log_path.unlink()
     return count
 
 

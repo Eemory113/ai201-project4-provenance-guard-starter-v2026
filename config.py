@@ -7,6 +7,7 @@ You'll edit the thresholds in Milestone 5 and the rate limits in unit 8.
 """
 
 import os
+import ipaddress
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -21,10 +22,24 @@ ROOT = Path(__file__).parent
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "5001"))
 
-# Flask's debug mode gives anyone who can reach the service an interactive
-# Python prompt inside your process. Fine on loopback, a gift to strangers
-# anywhere else — so it turns itself off the moment HOST isn't loopback.
-DEBUG = os.getenv("AI201_DEBUG", "1") == "1" and HOST in ("127.0.0.1", "localhost")
+
+def is_loopback_host(host: str) -> bool:
+    """Return whether a bind host is localhost or a loopback IP address."""
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def debug_enabled(host: str, requested: str) -> bool:
+    """Allow explicit debug opt-in only on a loopback bind address."""
+    return requested == "1" and is_loopback_host(host)
+
+
+# Debug is opt-in and remains unavailable on non-loopback bind addresses.
+DEBUG = debug_enabled(HOST, os.getenv("AI201_DEBUG", "0"))
 
 
 # ─── The local model ─────────────────────────────────────────────────────────
@@ -85,8 +100,8 @@ AI_THRESHOLD = 0.65
 # prints the bands; the reachable range is a different question.
 
 
-# ─── Rate limiting (UNIT 8) ──────────────────────────────────────────────────
-# Off in unit 7. You turn it on and choose the numbers in unit 8, Milestone 1.
+# ─── Rate limiting ────────────────────────────────────────────────────────────
+# Enabled for /submit. Limits are per client address.
 #
 # Think about two people: a real writer submitting their own work a few times
 # an hour, and a script sending a thousand variations to map your thresholds.
@@ -107,4 +122,8 @@ RATE_LIMIT_STORAGE = "memory://"
 
 LOG_DIR = ROOT / "logs"
 AUDIT_LOG = LOG_DIR / "audit.jsonl"
+AUDIT_MAX_BYTES = 5 * 1024 * 1024
+AUDIT_BACKUP_COUNT = 3
+AUDIT_MAX_CONTENT_CHARS = 4_000
+AUDIT_LOG_MAX_ENTRIES = 100
 RESULTS_DIR = ROOT / "results"

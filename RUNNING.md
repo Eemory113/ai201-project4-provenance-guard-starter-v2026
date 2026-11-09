@@ -187,28 +187,51 @@ trace look exactly like a quiet afternoon.
 
 ## Running it somewhere else (unit 9)
 
-Unit 9 asks you to deploy one of your systems. **Read this before you pick
-which one** — for this project the answer is already decided, and it isn't the
-hosted one.
+This project is designed for local/classroom use. Do not expose it to a network
+until you have completed the deployment checklist below. The local model has
+large resource requirements, and the audit log contains sensitive user text.
 
-Flask's built-in server says "development server" on startup because that's
-what it is. A real one comes from `gunicorn`, which is in
-`requirements.txt` and unused until now:
+Flask's built-in server is now explicitly blocked from binding non-loopback
+addresses. For a deployment on a protected network, use the production WSGI
+server (`gunicorn` is in `requirements.txt`):
 
 ```bash
-gunicorn app:app --bind 0.0.0.0:$PORT
+gunicorn app:app --bind "${HOST:-127.0.0.1}:${PORT:-5001}"
 ```
 
-Two settings do the work, and both read the environment:
+Use `HOST=0.0.0.0` only when a firewall or private network intentionally allows
+access. Do not bind a public interface directly. Put a maintained reverse
+proxy in front of Gunicorn and configure TLS and authentication there. The
+proxy must deny `/log`; do not rely on the app's loopback check when a local
+proxy connects to the app from `127.0.0.1`.
 
 | Variable | Default | What it does |
 |---|---|---|
 | `HOST` | `127.0.0.1` | Loopback — your machine only. A host needs `0.0.0.0`, or nothing outside the box can reach the service and it looks like the app is down |
-| `PORT` | `5000` | Most hosts hand you a port in `PORT` and expect you to bind exactly that one |
-| `AI201_DEBUG` | `1` | Debug mode. Off automatically whenever `HOST` isn't loopback — an interactive debugger on a public address is a stranger's Python prompt inside your process |
+| `PORT` | `5001` | Most hosts hand you a port in `PORT` and expect you to bind exactly that one |
+| `AI201_DEBUG` | `0` | Debug is off by default. `AI201_DEBUG=1` enables it only for loopback; the application refuses to use Flask's development server on non-loopback hosts |
 
-Nothing about your local workflow changes. With no variables set you get
-`http://127.0.0.1:5000` and every `curl` above still works.
+Nothing about your local workflow changes. With no variables set the
+development server binds `127.0.0.1:5001`.
+
+### Before any network exposure
+
+- Keep Flask debug mode off. Run behind a maintained WSGI server; do not use
+  `python app.py` for non-loopback access.
+- Use a firewall/private network and a reverse proxy configured for TLS and
+  authentication. Do not trust forwarded client-IP headers unless proxy
+  handling has been explicitly configured and reviewed.
+- Deny `/log` at the proxy. The endpoint is intended for direct loopback
+  development access, not for access through a local reverse proxy.
+- Replace in-memory rate-limit storage with a shared persistent backend before
+  running multiple workers or instances. In-memory quotas reset on restart and
+  are not shared by Gunicorn workers.
+- Complete request/body validation and size limits before accepting untrusted
+  submissions; the model performs expensive local inference.
+- Protect the `logs/` directory, set a retention policy, and monitor disk and
+  memory use. Audit entries can contain submitted text and appeal reasoning.
+- Test the exact deployment configuration on a private staging network before
+  opening a firewall or public route.
 
 ### This project will not fit a free host
 

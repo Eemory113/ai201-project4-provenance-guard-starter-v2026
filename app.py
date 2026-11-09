@@ -24,9 +24,11 @@ Routes:
     GET  /health      is the service up, and is the model loaded
 """
 
+import ipaddress
 import uuid
+from time import perf_counter
 
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 
 import audit
 import config
@@ -34,20 +36,48 @@ import config
 app = Flask(__name__)
 
 
-# ── Rate limiting — UNIT 8 ────────────────────────────────────────────────────
-# Off until you turn it on. In unit 8, Milestone 1:
-#
-#   1. Set RATE_LIMITING_ENABLED = True in config.py (or AI201_RATE_LIMITS=1)
-#   2. Choose your numbers there
-#   3. Uncomment the @limiter.limit(...) line on /submit below
-#
-# The order doesn't matter. While limiting is off, that decorator is a no-op
-# that quietly does nothing, so uncommenting it early costs you nothing — but
-# it also means no 429 until you've done step 1.
-#
-# The storage backend is preconfigured, which stops Flask-Limiter printing a
-# warning on every start. In-memory is right for one laptop and wrong for
-# anything real — a restart forgets every count.
+@app.before_request
+def assign_request_id():
+    """Assign a server-generated ID so every request and response can be traced."""
+    g.request_id = uuid.uuid4().hex
+    g.request_started_at = perf_counter()
+
+
+def _record_http_request(status_code: int) -> None:
+    if getattr(g, "request_logged", False):
+        return
+
+    duration_ms = (perf_counter() - g.request_started_at) * 1000
+    audit.log_http_request(
+        request_id=g.request_id,
+        method=request.method,
+        path=request.path,
+        endpoint=request.endpoint,
+        status_code=status_code,
+        duration_ms=duration_ms,
+    )
+    g.request_logged = True
+
+
+@app.after_request
+def record_request(response):
+    """Log every completed HTTP response and return its correlation ID."""
+    request_id = g.request_id
+    response.headers["X-Request-ID"] = request_id
+    _record_http_request(response.status_code)
+    return response
+
+
+@app.teardown_request
+def record_unhandled_request_error(exc):
+    """Capture exceptions re-raised before Flask can build a response."""
+    if exc is not None and hasattr(g, "request_id"):
+        _record_http_request(500)
+
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+# Enabled on /submit; requests are counted by client address. In-memory
+# storage is appropriate only for one local process and resets on restart.
 
 class _LimiterOff:
     """
@@ -67,27 +97,8 @@ if config.RATE_LIMITING_ENABLED:
     from flask_limiter import Limiter
     from flask_limiter.util import get_remote_address
 
-    def rate_limit_key():
-        """
-        Who a request counts against.
-
-        Falling back to the caller's address is the easy version. Unit 8's
-        stretch asks about per-creator limits instead — and the difference
-        matters: one script can look like a thousand callers, and one household
-        can look like one.
-        """
-        payload = request.get_json(silent=True)
-        # A body that parses as JSON but isn't an object — a bare list or
-        # string — has no .get. Without this guard the key function raises
-        # BEFORE the route runs, and a malformed request becomes a 500 that
-        # looks like your handler crashed when your handler never ran.
-        if not isinstance(payload, dict):
-            return get_remote_address()
-        creator = payload.get("creator_id")
-        return creator if isinstance(creator, str) and creator.strip() else get_remote_address()
-
     limiter = Limiter(
-        key_func=rate_limit_key,
+        key_func=get_remote_address,
         app=app,
         storage_uri=config.RATE_LIMIT_STORAGE,
         default_limits=[],
@@ -103,9 +114,13 @@ if config.RATE_LIMITING_ENABLED:
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
             payload = {}
+        creator_id = payload.get("creator_id")
+        if not isinstance(creator_id, str) or not creator_id.strip():
+            creator_id = "unknown"
         audit.log_rejection(
-            creator_id=payload.get("creator_id", "unknown"),
+            creator_id=creator_id,
             reason="rate_limited",
+            request_id=g.request_id,
             limit=str(exc.description),
         )
         return jsonify({
@@ -151,7 +166,7 @@ def health():
 # ── YOU BUILD THIS ────────────────────────────────────────────────────────────
 
 @app.post("/submit")
-# @limiter.limit(f"{config.RATE_LIMIT_PER_MINUTE}/minute;{config.RATE_LIMIT_PER_DAY}/day")
+@limiter.limit(f"{config.RATE_LIMIT_PER_MINUTE}/minute;{config.RATE_LIMIT_PER_DAY}/day")
 def submit():
     """
     Take a piece of text, decide about it, log the decision, answer.
@@ -251,18 +266,41 @@ def get_log():
 
         curl "http://127.0.0.1:5000/log?limit=10"
 
-    You need this in unit 8 to paste entries into your README, and you need it
-    now to see whether your logging is actually working.
+        Loopback clients only; responses are capped at 100 entries.
     """
-    limit = request.args.get("limit", type=int)
+    try:
+        remote_address = ipaddress.ip_address(request.remote_addr or "")
+    except ValueError:
+        remote_address = None
+    if remote_address is None or not remote_address.is_loopback:
+        return jsonify({"error": "log_access_denied"}), 403
+
+    raw_limit = request.args.get("limit")
+    if raw_limit is None:
+        limit = config.AUDIT_LOG_MAX_ENTRIES
+    else:
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            return jsonify({"error": "invalid_limit"}), 400
+        if limit < 1:
+            return jsonify({"error": "invalid_limit"}), 400
+    limit = min(limit, config.AUDIT_LOG_MAX_ENTRIES)
     entries = audit.read_entries(limit=limit)
     return jsonify({"count": len(entries), "entries": entries})
 
 
 def main():
+    if not config.is_loopback_host(config.HOST):
+        raise SystemExit(
+            "Refusing to expose Flask's development server on a non-loopback "
+            "address. Use a production WSGI server and complete the deployment "
+            "checklist in RUNNING.md."
+        )
+
     print(f"Provenance Guard on http://{config.HOST}:{config.PORT}")
     print(f"  detector model:  {config.DETECTOR_MODEL}")
-    print(f"  rate limiting:   {'ON' if config.RATE_LIMITING_ENABLED else 'off (unit 8)'}")
+    print(f"  rate limiting:   {'ON' if config.RATE_LIMITING_ENABLED else 'OFF'}")
     print(f"  audit log:       {config.AUDIT_LOG}")
     print()
     print("Check it's alive:")
